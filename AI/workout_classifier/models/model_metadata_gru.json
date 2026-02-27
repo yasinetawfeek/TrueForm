@@ -1,0 +1,62 @@
+{
+  "model_type": "BiGRU",
+  "n_classes": 22,
+  "n_timesteps": 15,
+  "n_features": 36,
+  "sequence_shape": [
+    15,
+    36
+  ],
+  "class_names": [
+    "barbell biceps curl",
+    "bench press",
+    "chest fly machine",
+    "deadlift",
+    "decline bench press",
+    "hammer curl",
+    "hip thrust",
+    "incline bench press",
+    "lat pulldown",
+    "lateral raise",
+    "leg extension",
+    "leg raises",
+    "plank",
+    "pull Up",
+    "push-up",
+    "romanian deadlift",
+    "russian twist",
+    "shoulder press",
+    "squat",
+    "t bar row",
+    "tricep Pushdown",
+    "tricep dips"
+  ],
+  "test_accuracy": 0.8256410256410256,
+  "model_path": "models/gru_workout_classifier.keras",
+  "class_names_path": "models/class_names_gru.json",
+  "normalization_params_path": "models/normalization_params_gru.json",
+  "model_architecture": {
+    "layers": [
+      {
+        "type": "Bidirectional GRU",
+        "units": 128,
+        "return_sequences": true
+      },
+      {
+        "type": "Bidirectional GRU",
+        "units": 64,
+        "return_sequences": false
+      },
+      {
+        "type": "Dense",
+        "units": 64,
+        "activation": "relu"
+      },
+      {
+        "type": "Dense",
+        "units": 22,
+        "activation": "softmax"
+      }
+    ]
+  }
+}

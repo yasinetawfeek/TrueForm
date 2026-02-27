@@ -1,0 +1,141 @@
+.video-list {
+  padding: 1rem;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.video-list h3 {
+  font-size: 1.1rem;
+  margin-bottom: 1rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid #3a3a3a;
+}
+
+.video-list-content {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.workout-group {
+  margin-bottom: 1.5rem;
+}
+
+.workout-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+  padding: 0.5rem;
+  background-color: #3a3a3a;
+  border-radius: 4px;
+}
+
+.workout-header h4 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #4a9eff;
+}
+
+.video-count {
+  font-size: 0.8rem;
+  color: #aaa;
+  background-color: #2a2a2a;
+  padding: 0.2rem 0.5rem;
+  border-radius: 10px;
+}
+
+.workout-videos {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.video-item {
+  padding: 0.5rem;
+  background-color: #3a3a3a;
+  border-radius: 4px;
+  transition: background-color 0.2s;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.video-item.ignored {
+  opacity: 0.6;
+  background-color: #2a2a2a;
+}
+
+.video-item-content {
+  flex: 1;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.video-item:hover:not(.ignored) {
+  background-color: #4a4a4a;
+}
+
+.video-item.active {
+  background-color: #4a9eff;
+  color: white;
+}
+
+.video-item.active.ignored {
+  background-color: #3a7eef;
+}
+
+.video-item-name {
+  font-size: 0.85rem;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.active-indicator {
+  margin-left: 0.5rem;
+  font-size: 0.8rem;
+  flex-shrink: 0;
+}
+
+.ignore-toggle {
+  background-color: transparent;
+  border: 2px solid #666;
+  border-radius: 4px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 1rem;
+  font-weight: bold;
+  color: #aaa;
+  transition: all 0.2s;
+  flex-shrink: 0;
+  padding: 0;
+  line-height: 1;
+}
+
+.ignore-toggle:hover {
+  border-color: #ff6b6b;
+  color: #ff6b6b;
+  background-color: rgba(255, 107, 107, 0.1);
+}
+
+.ignore-toggle.ignored {
+  background-color: #ff6b6b;
+  border-color: #ff6b6b;
+  color: white;
+}
+
+.ignore-toggle.ignored:hover {
+  background-color: #ff5252;
+  border-color: #ff5252;
+}

@@ -1,0 +1,28 @@
+# Videos directory
+/Videos
+
+# Output directory
+/output
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Environment variables
+.env
+.env.local
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Logs
+*.log

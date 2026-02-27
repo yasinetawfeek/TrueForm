@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# Machine Learning Models
+# Uncomment the lines below if you want to ignore model files
+# *.h5
+# *.hdf5
+# *.keras
+# *.pkl
+# *.pickle
+# *.joblib
+# *.weights
+# *.ckpt
+# *.pt
+# *.pth
+# *.onnx
+# *.tflite
+# *.pb
+# *.pbtxt
+
+# Large data files
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.arrow
+*.avro
+*.orc
+*.json.gz
+*.csv.gz
+*.parquet.gz
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Logs
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db

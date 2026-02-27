@@ -1,0 +1,80 @@
+{
+  "model_type": "Transformer",
+  "n_classes": 22,
+  "n_timesteps": 15,
+  "n_features": 36,
+  "sequence_shape": [
+    15,
+    36
+  ],
+  "class_names": [
+    "barbell biceps curl",
+    "bench press",
+    "chest fly machine",
+    "deadlift",
+    "decline bench press",
+    "hammer curl",
+    "hip thrust",
+    "incline bench press",
+    "lat pulldown",
+    "lateral raise",
+    "leg extension",
+    "leg raises",
+    "plank",
+    "pull Up",
+    "push-up",
+    "romanian deadlift",
+    "russian twist",
+    "shoulder press",
+    "squat",
+    "t bar row",
+    "tricep Pushdown",
+    "tricep dips"
+  ],
+  "test_accuracy": 0.9353846153846154,
+  "model_path": "models/transformer_workout_classifier.keras",
+  "class_names_path": "models/class_names_transformer.json",
+  "normalization_params_path": "models/normalization_params_transformer.json",
+  "model_architecture": {
+    "d_model": 128,
+    "num_heads": 8,
+    "dff": 512,
+    "num_layers": 4,
+    "dropout_rate": 0.1,
+    "layers": [
+      {
+        "type": "Input Projection",
+        "units": 128
+      },
+      {
+        "type": "Positional Encoding",
+        "max_len": 15
+      },
+      {
+        "type": "Transformer Block",
+        "count": 4,
+        "d_model": 128,
+        "num_heads": 8,
+        "dff": 512
+      },
+      {
+        "type": "Global Average Pooling"
+      },
+      {
+        "type": "Dense",
+        "units": 128,
+        "activation": "gelu"
+      },
+      {
+        "type": "Dense",
+        "units": 64,
+        "activation": "gelu"
+      },
+      {
+        "type": "Dense",
+        "units": 22,
+        "activation": "softmax"
+      }
+    ]
+  }
+}
