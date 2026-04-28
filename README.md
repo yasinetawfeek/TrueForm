@@ -1,416 +1,229 @@
-# 🏋️ TrueForm
+# TrueForm
 
-<div align="center">
+**Turn camera pixels into structured movement: extract poses from video, recognize exercises with machine learning, and surface form cues in real time.**
 
-**An intelligent workout pose analysis system powered by MediaPipe and Machine Learning**
+[![Python](https://img.shields.io/badge/Python-3.8+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![MediaPipe](https://img.shields.io/badge/MediaPipe-Pose-4285F4?logo=google&logoColor=white)](https://developers.google.com/mediapipe)
+[![React](https://img.shields.io/badge/React-18+-61DAFB?logo=react&logoColor=black)](https://react.dev/)
+[![Flask](https://img.shields.io/badge/Flask-API-000000?logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
+[![Workout classifier (best)](https://img.shields.io/badge/Workout%20classifier%20(test)-98.7%25%20Transformer-brightgreen)](#results-and-performance)
+[![XGBoost](https://img.shields.io/badge/XGBoost%20(test)-98.2%25-green)](#results-and-performance)
 
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
-[![MediaPipe](https://img.shields.io/badge/MediaPipe-0.10+-orange.svg)](https://mediapipe.dev/)
-[![Flask](https://img.shields.io/badge/Flask-2.3+-green.svg)](https://flask.palletsprojects.com/)
-[![React](https://img.shields.io/badge/React-18+-61dafb.svg)](https://reactjs.org/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+TrueForm is an end-to-end **fitness pose intelligence** stack: a Python data pipeline for video and landmarks, Jupyter-based research for **workout classification** and **pose correction**, and a **React + Flask** experience that runs **MediaPipe in the browser** and streams predictions over **Socket.IO**.
 
-</div>
-
----
-
-## 📋 Table of Contents
-
-- [Overview](#-overview)
-- [Features](#-features)
-- [Project Structure](#-project-structure)
-- [Installation](#-installation)
-- [Quick Start](#-quick-start)
-- [Components](#-components)
-- [Supported Workouts](#-supported-workouts)
-- [Technology Stack](#-technology-stack)
-- [Documentation](#-documentation)
-- [Contributing](#-contributing)
-- [License](#-license)
+If you care about **how a rep looks**, not just whether it happened, this repository is the reference implementation.
 
 ---
 
-## 🎯 Overview
+## Results and performance
 
-TrueForm is a comprehensive workout pose analysis pipeline that extracts human pose landmarks from exercise videos, trains machine learning classifiers to recognize workout types, and provides interactive visualization tools for pose inspection. The system achieves **95.0% accuracy** in classifying 22 different workout exercises using XGBoost.
+> **98.7%** peak **test** accuracy (Transformer, 17-class checkpoint) · **98.2%** XGBoost (16-class) · sequence models (**BiGRU**, **BiLSTM**) **98.4–98.5%** on the same family of pose windows.
 
-### Key Capabilities
+Bundled **workout classifiers** are evaluated on a **held-out test split**; figures below come from the shipped [`AI/workout_classifier/models/`](AI/workout_classifier/models/) metadata files (`model_metadata*.json`).
 
-- 🎥 **Video Pose Extraction**: Extract 12 core body landmarks from workout videos using MediaPipe
-- 🤖 **ML Classification**: Train and deploy models (XGBoost, Random Forest, Transformer, BiLSTM, GRU) to classify workout types
-- 📊 **Interactive Visualization**: Visualize pose sequences with skeleton overlays and real-time predictions
-- 🌐 **Web Applications**: 
-  - Real-time webcam workout classifier
-  - Video viewer with pose skeleton overlay
-- 📈 **Data Pipeline**: Batch processing with parallel support for large video datasets
+| Model | Test accuracy | Classes | Artifact |
+|------:|:--------------:|:-------:|----------|
+| **Transformer** | **98.7%** | 17 | `transformer_workout_classifier.keras` |
+| **BiGRU** | **98.5%** | 16 | `gru_workout_classifier.keras` |
+| **BiLSTM** | **98.4%** | 16 | `bilstm_workout_classifier.keras` |
+| **XGBoost** | **98.2%** | 16 | `xgboost_workout_classifier.pkl` |
+| **Random Forest** | **98.0%** | 17 | `randomforest_workout_classifier.pkl` |
+
+<details>
+<summary><strong>Exact values from metadata</strong> (for reproducibility)</summary>
+
+| Model | `test_accuracy` |
+|-------|----------------:|
+| Transformer | 0.986654 |
+| BiGRU | 0.985054 |
+| BiLSTM | 0.983514 |
+| XGBoost | 0.982246 |
+| Random Forest | 0.979854 |
+
+</details>
+
+**Takeaway:** sequence models on normalized pose windows reach **up to ~98.7%** test accuracy on this checkpoint’s label set; **XGBoost** remains a strong **~98.2%** classical baseline on **16** classes. Class counts differ slightly by checkpoint (16 vs 17) because of how each training run was sliced from the pipeline—see each `class_names*.json` next to the model.
+
+### Pose correction (single-frame displacement)
+
+The [`AI/pose_correction_single_frame/`](AI/pose_correction_single_frame/) notebooks define a **predict-zero baseline** on the metric that matters: **masked MAE on joints with non-zero ground-truth displacement** (printed baseline **0.099754** ≈ **0.10** on the committed run). Final values are the **best validation** `val_masked_displaced_joint_mae` seen in the saved training logs.
+
+**Relative MAE reduction** (same formula for each row): **100 × (baseline − final) / baseline**.
+
+| Model | Notebook | Baseline MAE | Final val MAE | **Improvement** |
+|-------|----------|-------------:|--------------:|--------------:|
+| MLP | [`MLP_pose_correction_single_frame.ipynb`](AI/pose_correction_single_frame/MLP_pose_correction_single_frame.ipynb) | 0.0998 | 0.0246 | **75%** |
+| DNN | [`DNN_pose_correction_single_frame.ipynb`](AI/pose_correction_single_frame/DNN_pose_correction_single_frame.ipynb) | 0.0998 | 0.0243 | **76%** |
+| GNN | [`GNN_pose_correction_single_frame.ipynb`](AI/pose_correction_single_frame/GNN_pose_correction_single_frame.ipynb) | 0.0998 | 0.0390 | **61%** |
+
+Temporal pose-correction models under [`AI/pose_correction/`](AI/pose_correction/) (LSTM, TCN-FiLM, TFT, etc.) optimize **MSE / MAE on full displacement vectors** with a different scale than this masked single-frame baseline; see each notebook’s `val_loss` / `val_mae` curves rather than the **0.10** reference.
+
+The single-frame notebooks also note a **frame-level train/val split** (not video-level), so treat these metrics as **in-repo benchmarks**, not guarantees of generalization to new videos until you add a video-held-out evaluation.
 
 ---
 
-## ✨ Features
+## Why TrueForm
 
-### Core Features
-
-- ✅ **Pose Landmark Extraction**: 12 key body points (shoulders, elbows, wrists, hips, knees, ankles)
-- ✅ **Position-Invariant Normalization**: All poses normalized relative to hip center
-- ✅ **Sequence-Based Processing**: Organizes frames into configurable sequences (default: 15 frames)
-- ✅ **Batch Processing**: Parallel processing support for multiple videos
-- ✅ **Multiple ML Models**: Support for XGBoost, Random Forest, Transformer, BiLSTM, and GRU
-- ✅ **Real-Time Classification**: Webcam-based live workout recognition
-- ✅ **Interactive Visualizations**: Navigate, animate, and inspect pose sequences
-- ✅ **Web Interface**: Modern React frontend with Flask backend
-
-### Model Performance
-
-| Model | Accuracy | Notes |
-|-------|----------|-------|
-| **XGBoost** | **95.0%** | Best performing model |
-| Random Forest | 92.3% | 200 trees, max_depth=20 |
-| Transformer | - | Deep learning model |
-| BiLSTM | - | Sequential model |
-| GRU | - | Sequential model |
+| You want to… | TrueForm gives you… |
+|----------------|---------------------|
+| Build a dataset from workout footage | MediaPipe-based extraction, normalization, and sequence packaging from `Data/` |
+| Train or compare classifiers | Notebooks and artifacts for tree-based and sequence models in `AI/workout_classifier/` |
+| Study *how* to correct form | Pose-correction experiments (temporal and single-frame) under `AI/pose_correction*` |
+| Ship a live demo | A Vite + React client with skeleton overlay and a selectable model stack in `Webapp/` |
 
 ---
 
-## 📁 Project Structure
+## What you get out of the box
+
+- **Pose from video** — 12 core body landmarks per frame (shoulders, elbows, wrists, hips, knees, ankles), **hip-centered normalization** for position invariance, and **fixed-length sequences** for ML (defaults are tunable: FPS, window length, parallelism).
+- **Workout classification** — Trained pipelines including **XGBoost**, **Random Forest**, and sequence models (**Transformer**, **BiLSTM**, **BiGRU**) used by the realtime app. See **[Results and performance](#results-and-performance)** for test accuracies on the bundled checkpoints.
+- **Pose correction research** — Temporal models (e.g. LSTM embedding, TCN-FiLM, TFT) and **single-frame** correction explorations (MLP, DNN, GNN notebooks) for displacement and coaching-style signals.
+- **Realtime web app** — Webcam **MediaPipe** on the client, **Flask-SocketIO** inference on the server, **top predictions**, and **correction overlays** (arrows) driven by the selected model pair. Muscle illustrations are present in the UI as static reference art.
+
+---
+
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+  subgraph capture [Capture]
+    V[Video files]
+    W[Webcam + MediaPipe web]
+  end
+  subgraph pipeline [Pipeline]
+    E[Pose extraction & sequences]
+    D[(JSON / NPZ datasets)]
+  end
+  subgraph models [Models]
+    C[Workout classifiers]
+    P[Pose correction models]
+  end
+  subgraph app [Apps]
+    R[Realtime React UI]
+    VV[Video viewer]
+  end
+  V --> E
+  E --> D
+  D --> C
+  W --> R
+  R <-->|Socket.IO| C
+  C --> P
+  P --> R
+  D --> VV
+```
+
+---
+
+## Repository map
 
 ```
 TrueForm/
-├── 📂 Data/                          # Data processing pipeline
-│   ├── video_pose_extractor.py      # Pose extraction from videos
-│   ├── pose_visualizer.py           # Interactive pose visualizer
-│   ├── requirements.txt             # Python dependencies
-│   ├── Videos/                      # Raw workout videos (organized by type)
-│   ├── output/                      # Extracted pose data
-│   └── video_viewer/                # Web video viewer application
-│       ├── backend/                 # Flask backend
-│       └── frontend/                # React frontend
-│
-├── 📂 AI/                            # Machine learning models
-│   ├── pose_visualizer_with_predictions.py
-│   └── workout_classifier/          # Model training notebooks
-│       ├── XGboost_workout_classifier.ipynb
-│       ├── RandomForest_workout_classifier.ipynb
-│       ├── Transformer_workout_classifier.ipynb
-│       ├── BiLSTM_workout_classifier.ipynb
-│       ├── GRU_workout_classifier.ipynb
-│       └── models/                 # Trained model files
-│
-└── 📂 Testing/                       # Real-time webcam classifier
-    ├── app.py                       # Flask web application
-    ├── model_loader.py              # Model loading utilities
-    ├── templates/                   # HTML templates
-    └── static/                      # CSS styles
+├── Data/                    # Extraction, batch processing, local visualizers
+│   ├── video_pose_extractor.py
+│   ├── pose_visualizer.py
+│   ├── video_viewer/        # Flask + React video browser with pose overlay
+│   └── web_scrapper/        # Helpers for sourcing training media
+├── AI/
+│   ├── workout_classifier/  # Notebooks + exported models (XGBoost, RF, …)
+│   ├── pose_correction/     # Temporal correction notebooks & utilities
+│   ├── pose_correction_single_frame/
+│   └── pose_visualizer_with_predictions.py
+└── Webapp/                  # Realtime classifier + correction (Vite + Flask-SocketIO)
+    ├── backend/
+    └── frontend/
 ```
+
+Deeper component docs live next to the code: [`Data/README.md`](Data/README.md), [`Data/video_viewer/README.md`](Data/video_viewer/README.md), [`Webapp/README.md`](Webapp/README.md).
 
 ---
 
-## 🚀 Installation
+## Quick start
 
-### Prerequisites
-
-- **Python 3.8+** with pip
-- **Node.js 14+** with npm (for web applications)
-- **Webcam** (for real-time classification)
-
-### Step 1: Clone the Repository
+### 1. Clone
 
 ```bash
-git clone https://github.com/yourusername/TrueForm.git
+git clone https://github.com/yasinetawfeek/TrueForm.git
 cd TrueForm
 ```
 
-### Step 2: Install Python Dependencies
-
-#### Data Processing Pipeline
+### 2. Data pipeline (Python)
 
 ```bash
 cd Data
 pip install -r requirements.txt
-```
-
-**Dependencies:** `opencv-python`, `mediapipe`, `numpy`, `matplotlib`, `Pillow`, `tqdm`
-
-#### Video Viewer Backend
-
-```bash
-cd Data/video_viewer/backend
-pip install -r requirements.txt
-```
-
-#### Real-Time Classifier
-
-```bash
-cd Testing
-pip install -r requirements.txt
-```
-
-**Additional ML Dependencies:** `scikit-learn`, `xgboost`, `pandas`, `seaborn`, `tensorflow`
-
-### Step 3: Install Frontend Dependencies (Optional)
-
-For the video viewer web application:
-
-```bash
-cd Data/video_viewer/frontend
-npm install
-```
-
----
-
-## 🏃 Quick Start
-
-### 1. Extract Poses from Videos
-
-Process a single video:
-
-```bash
-cd Data
 python video_pose_extractor.py path/to/video.mp4 -o output/
 ```
 
-Process all videos in a directory:
+Interactive inspection of saved sequences:
 
 ```bash
-python video_pose_extractor.py Videos/ -o output/ -p 4
+python pose_visualizer.py output/training_data.json
 ```
 
-### 2. Train a Classifier
+### 3. Realtime workout + corrections (recommended demo)
 
-Open and run the Jupyter notebook:
+Backend (expects a Conda env named `true_form` — adjust to your setup):
+
+```bash
+cd Webapp
+conda run -n true_form pip install -r backend/requirements.txt
+npm --prefix frontend install
+npm run dev:backend
+```
+
+Frontend (second terminal):
+
+```bash
+cd Webapp
+npm run dev
+```
+
+Open **http://localhost:5173**. The UI talks to the API on **http://localhost:8001** by default; see [`Webapp/README.md`](Webapp/README.md) for ports and `VITE_AI_URL`.
+
+### 4. Train or explore models
 
 ```bash
 cd AI/workout_classifier
 jupyter notebook XGboost_workout_classifier.ipynb
 ```
 
-### 3. Real-Time Classification
-
-Start the webcam classifier:
-
-```bash
-cd Testing
-python app.py
-```
-
-Open `http://localhost:5000` in your browser.
-
-### 4. Video Viewer
-
-Use the startup script:
-
-```bash
-cd Data/video_viewer
-./start.sh
-```
-
-Or manually start backend and frontend:
-
-```bash
-# Terminal 1: Backend
-cd Data/video_viewer/backend
-python app.py
-
-# Terminal 2: Frontend
-cd Data/video_viewer/frontend
-npm start
-```
+Pose-correction notebooks live under `AI/pose_correction/` and `AI/pose_correction_single_frame/`.
 
 ---
 
-## 🧩 Components
+## Exercise coverage
 
-### 1. Video Pose Extractor
-
-Extracts pose landmarks from videos using MediaPipe Pose.
-
-**Key Features:**
-- Extracts 12 body landmarks (x, y, z) per frame
-- Normalizes positions relative to hip center
-- Organizes frames into sequences (default: 15 frames × 1.0s)
-- Supports single video or batch processing
-- Parallel processing with multiprocessing
-
-**Usage:**
-
-```bash
-# Single video
-python video_pose_extractor.py video.mp4 -o output/ --workout-class "squat"
-
-# Batch processing
-python video_pose_extractor.py Videos/ -o output/ -p 4
-```
-
-**Options:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-o, --output DIR` | `output/` | Output directory |
-| `--fps N` | `15` | Target frames per second |
-| `--duration N` | `1.0` | Sequence duration in seconds |
-| `-p, --num-processes N` | `1` | Parallel workers (0 = auto-detect) |
-| `--workout-class NAME` | `None` | Attach class label |
-
-### 2. Pose Visualizer
-
-Interactive tool to visualize extracted pose sequences.
-
-**Usage:**
-
-```bash
-python pose_visualizer.py output/training_data.json
-```
-
-**Controls:**
-- `←` / `→` or `A` / `D`: Previous / next frame
-- `↑` / `↓` or `W` / `S`: Previous / next sequence
-- `Space`: Start animation
-- `Q`: Quit
-- **Hover**: See landmark coordinates
-
-### 3. Workout Classifiers
-
-Train ML models to classify workout types from pose sequences.
-
-**Available Models:**
-- **XGBoost** (95.0% accuracy) - Recommended
-- **Random Forest** (92.3% accuracy)
-- **Transformer** (Deep learning)
-- **BiLSTM** (Sequential model)
-- **GRU** (Sequential model)
-
-**Dataset:** 16,239 sequences across 22 workout classes
-
-### 4. Real-Time Webcam Classifier
-
-Web application for real-time workout classification using your webcam.
-
-**Features:**
-- Live pose detection with MediaPipe
-- Multiple model support
-- Top-3 predictions with confidence scores
-- Skeleton visualization overlay
-
-### 5. Video Viewer
-
-Web application to browse and view videos with pose skeleton overlay.
-
-**Features:**
-- Browse videos organized by workout type
-- Real-time MediaPipe pose detection
-- Video navigation controls
-- Play/pause and seek functionality
+- **Data organization** supports a broad set of strength movements (see [`Data/README.md`](Data/README.md) for the full taxonomy used in folders and extraction).
+- **Bundled XGBoost labels** (16 classes) are listed in [`AI/workout_classifier/models/class_names.json`](AI/workout_classifier/models/class_names.json). Your own runs can expand or change this set as you add data.
 
 ---
 
-## 🏋️ Supported Workouts
+## Tech stack
 
-The system currently supports **22 workout exercises**:
-
-| Exercise | Exercise | Exercise |
-|----------|----------|----------|
-| Barbell Biceps Curl | Bench Press | Chest Fly Machine |
-| Deadlift | Decline Bench Press | Hammer Curl |
-| Hip Thrust | Incline Bench Press | Lat Pulldown |
-| Lateral Raise | Leg Extension | Leg Raises |
-| Plank | Pull Up | Push-up |
-| Romanian Deadlift | Russian Twist | Shoulder Press |
-| Squat | T Bar Row | Tricep Dips |
-| Tricep Pushdown | | |
+| Layer | Choices |
+|-------|---------|
+| Pose | [MediaPipe Pose](https://google.github.io/mediapipe/solutions/pose) (Python + browser) |
+| Video / numerics | OpenCV, NumPy |
+| Classical ML | scikit-learn, XGBoost |
+| Deep learning | TensorFlow / Keras (notebooks + realtime correction paths) |
+| APIs | Flask, Flask-SocketIO |
+| Web UI | React 18, Vite |
 
 ---
 
-## 🛠 Technology Stack
+## Contributing
 
-### Backend
-- **Python 3.8+**
-- **MediaPipe** - Pose detection
-- **OpenCV** - Video processing
-- **Flask** - Web framework
-- **NumPy** - Numerical computing
-- **scikit-learn** - Machine learning
-- **XGBoost** - Gradient boosting
-- **TensorFlow/Keras** - Deep learning
-
-### Frontend
-- **React** - UI framework
-- **MediaPipe** (Web) - Client-side pose detection
-- **CSS3** - Styling
-
-### Data Science
-- **Jupyter Notebooks** - Model development
-- **Pandas** - Data manipulation
-- **Matplotlib** - Visualization
-- **Seaborn** - Statistical visualization
+Issues and pull requests are welcome. For code style, prefer **PEP 8** on Python, match existing patterns in each subproject, and update the relevant subdirectory README when behavior or setup changes.
 
 ---
 
-## 📚 Documentation
+## Acknowledgments
 
-Detailed documentation is available in each component's directory:
-
-- **[Data Pipeline Documentation](Data/README.md)** - Pose extraction and visualization
-- **[Video Viewer Documentation](Data/video_viewer/README.md)** - Web video viewer setup
-- **[Real-Time Classifier Documentation](Testing/README.md)** - Webcam classifier setup
-
-### Data Format
-
-Each pose sequence contains:
-- **12 landmarks** (shoulders, elbows, wrists, hips, knees, ankles)
-- **3D coordinates** (x, y, z) normalized to hip center
-- **15 frames** per sequence (configurable)
-- **Visibility and presence scores** for each landmark
-
-### Model Input Format
-
-- **Shape**: `(N, 15, 12, 3)` → Flattened to `(N, 540)`
-- **Normalization**: Relative to hip center (position-invariant)
-- **Labels**: 22 workout classes (integer-encoded or one-hot)
+Built on [MediaPipe](https://developers.google.com/mediapipe), the [OpenCV](https://opencv.org/) ecosystem, and the open-source ML tools cited in each component’s `requirements.txt`. Thanks to everyone who files issues, tries the notebooks, and improves the demos.
 
 ---
 
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
-### Development Guidelines
-
-- Follow PEP 8 style guidelines for Python code
-- Add docstrings to functions and classes
-- Include tests for new features
-- Update documentation as needed
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-## 🙏 Acknowledgments
-
-- **MediaPipe** by Google for pose detection capabilities
-- **OpenCV** community for video processing tools
-- All contributors and users of this project
-
----
-
-## 📧 Contact
-
-For questions, issues, or contributions, please open an issue on GitHub.
-
----
-
-<div align="center">
-
-**Made with ❤️ for fitness enthusiasts and developers**
-
-⭐ Star this repo if you find it helpful!
-
-</div>
+<p align="center">
+  <strong>TrueForm</strong> — structure in every rep.<br/>
+  <sub>If this project helps your work, consider starring the repo on GitHub.</sub>
+</p>

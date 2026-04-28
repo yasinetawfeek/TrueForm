@@ -7,6 +7,11 @@ __pycache__/
 .ipynb_checkpoints
 *.ipynb_checkpoints/
 
+# Models
+workout_classifier/models
+pose_correction_single_frame/saved_models
+pose_correction/models
+
 # Machine Learning Models
 # Uncomment the lines below if you want to ignore model files
 # *.h5

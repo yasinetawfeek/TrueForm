@@ -3,6 +3,10 @@
 
 # Output directory
 /output
+/output_displacement
+/output_displacement_single_frame
+/output_displacement_single_frame_new
+/web_scrapper
 
 # Python cache
 __pycache__/

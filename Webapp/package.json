@@ -1,0 +1,11 @@
+{
+  "name": "trueform-webapp-workspace",
+  "private": true,
+  "scripts": {
+    "dev": "npm run dev:frontend",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "dev:backend": "conda run -n true_form python backend/main.py",
+    "build": "npm --prefix frontend run build",
+    "preview": "npm --prefix frontend run preview"
+  }
+}

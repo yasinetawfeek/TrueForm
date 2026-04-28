@@ -15,11 +15,13 @@ import numpy as np
 import json
 import argparse
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Sequence as TypingSequence
 import os
 import sys
+import time
 import logging
 import warnings
+import urllib.request
 
 # Suppress ALL warnings first, before importing other libraries
 warnings.filterwarnings('ignore')
@@ -29,6 +31,9 @@ os.environ['PYTHONWARNINGS'] = 'ignore'
 os.environ['GLOG_minloglevel'] = '3'  # Only show FATAL (suppress INFO, WARNING, ERROR)
 os.environ['OPENCV_LOG_LEVEL'] = 'SILENT'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow warnings (if used by MediaPipe)
+os.environ.setdefault('GRPC_VERBOSITY', 'NONE')
+os.environ.setdefault('GRPC_TRACE', '')
+os.environ.setdefault('ABSL_MIN_LOG_LEVEL', '3')
 
 # Suppress NumPy warnings
 np.seterr(all='ignore')
@@ -49,6 +54,18 @@ for logger_name in ['absl', 'mediapipe', 'google', 'sklearn', 'numpy', 'cv2', 'P
     logger.setLevel(logging.CRITICAL)
     logger.disabled = True
     logger.propagate = False
+
+def _video_pose_worker_quiet() -> bool:
+    """True in pool workers when worker-side prints should be suppressed."""
+    if os.environ.get('VIDEO_POSE_EXTRACT_VERBOSE', '').lower() in ('1', 'true', 'yes'):
+        return False
+    return os.environ.get('VIDEO_POSE_EXTRACT_QUIET', '').lower() in ('1', 'true', 'yes')
+
+
+def _vlog(msg: str = '', *, flush: bool = False, end: str = '\n') -> None:
+    if not _video_pose_worker_quiet():
+        print(msg, flush=flush, end=end)
+
 
 # Import libraries after warning suppression is set up
 from tqdm import tqdm
@@ -93,12 +110,21 @@ class VideoPoseExtractor:
     - FPS > 30: Skips frames to maintain 15 frames per 0.5 seconds
     - FPS < 30: Duplicates frames to maintain 15 frames per 0.5 seconds
     
+    Optional ``video_speed_augment`` reopens each video at configured speed factors
+    and appends additional sequences (each tagged with ``video_speed_factor``).
+    Optional ``sequence_start_stride`` emits overlapping sliding windows along the
+    sampled stream (mirroring and speed passes use the same stride).
+
     Only the 12 core body landmarks are kept (shoulders, elbows, wrists,
     hips, knees, ankles). Face, hand, and foot landmarks are discarded.
     """
     
     def __init__(self, fps: int = 15, sequence_duration: float = 1.0, 
-                 normalize_pose: bool = False, augment_data: bool = False):
+                 normalize_pose: bool = False, augment_data: bool = False,
+                 video_speed_augment: bool = False,
+                 video_speed_factors: Optional[TypingSequence[float]] = None,
+                 sequence_start_stride: Optional[int] = None,
+                 verbose_pool_workers: bool = False):
         """
         Initialize the pose extractor.
         
@@ -107,36 +133,105 @@ class VideoPoseExtractor:
             sequence_duration: Duration of each sequence in seconds (default: 1.0)
             normalize_pose: If True, normalize landmarks relative to hip center (default: False)
             augment_data: If True, apply data augmentation (mirror, etc.) (default: False)
+            video_speed_augment: If True, also extract sequences from time-stretched views of each
+                video (see video_speed_factors), in addition to the normal-speed pass (default: False).
+            video_speed_factors: Playback speed multipliers for augmentation (e.g. 0.75 = slower motion,
+                1.25 = faster). Values of 1.0 are ignored. When video_speed_augment is True and this
+                is None, defaults to (0.75, 1.25).
+            sequence_start_stride: How many consecutive stream samples (after frame_skip /
+                speed resampling) to advance the start of the next window after each emitted
+                sequence. ``None`` means no overlap: stride equals ``frames_per_sequence``.
+                Use a smaller integer (e.g. 5) for overlapping sliding windows. Must be in
+                ``[1, frames_per_sequence]``.
+            verbose_pool_workers: If True, pool workers print full per-video logs (noisy when
+                many processes run in parallel). Default False suppresses worker prints and
+                emits a periodic heartbeat instead.
         """
         self.target_fps = fps  # Always target 15 fps for sequences (15 frames per 1.0s)
         self.sequence_duration = sequence_duration
         self.frames_per_sequence = int(fps * sequence_duration)  # Always 15 frames per sequence
         self.normalize_pose = normalize_pose
         self.augment_data = augment_data
-        
-        # Initialize MediaPipe Pose (suppress stderr during initialization)
-        self.mp_pose = mp.solutions.pose
-        
-        # Redirect stderr to suppress MediaPipe initialization messages
-        old_stderr = sys.stderr
-        old_stdout = sys.stdout
-        devnull = open(os.devnull, 'w')
-        sys.stderr = devnull
-        sys.stdout = devnull
+        self.video_speed_augment = video_speed_augment
+        if video_speed_factors is not None:
+            self.video_speed_factors = tuple(float(x) for x in video_speed_factors)
+        else:
+            self.video_speed_factors = (0.75, 1.25)
+
+        if sequence_start_stride is not None:
+            if sequence_start_stride < 1:
+                raise ValueError(f"sequence_start_stride must be >= 1, got {sequence_start_stride}")
+            if sequence_start_stride > self.frames_per_sequence:
+                raise ValueError(
+                    f"sequence_start_stride ({sequence_start_stride}) must be <= "
+                    f"frames_per_sequence ({self.frames_per_sequence})"
+                )
+        self.sequence_start_stride = sequence_start_stride
+        self.verbose_pool_workers = verbose_pool_workers
+
+        # MediaPipe Tasks (Pose Landmarker) replaces deprecated solutions API.
+        # We use VIDEO running mode so we can provide per-frame timestamps.
+        self._pose_landmarker = self._create_pose_landmarker()
+
+    def close(self) -> None:
+        if getattr(self, "_pose_landmarker", None) is not None:
+            try:
+                self._pose_landmarker.close()
+            except Exception:
+                pass
+            self._pose_landmarker = None
+
+    def __del__(self) -> None:
+        self.close()
+
+    def _ensure_pose_landmarker_model(self) -> str:
+        """
+        Ensure the Pose Landmarker .task model exists locally.
+        Returns the absolute path to the model file.
+        """
+        models_dir = Path(__file__).resolve().parent / "models"
+        models_dir.mkdir(parents=True, exist_ok=True)
+        model_path = models_dir / "pose_landmarker_heavy.task"
+
+        if model_path.exists():
+            return str(model_path)
+
+        # Official MediaPipe model location (heavy, float16).
+        url = (
+            "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+            "pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task"
+        )
+
+        # Download atomically to avoid partial files.
+        tmp_path = model_path.with_suffix(model_path.suffix + ".tmp")
         try:
-            self.pose = self.mp_pose.Pose(
-                static_image_mode=False,
-                model_complexity=2,
-                enable_segmentation=False,
-                min_detection_confidence=0.7,
-                min_tracking_confidence=0.7
-            )
+            urllib.request.urlretrieve(url, tmp_path)  # nosec - fixed URL
+            tmp_path.replace(model_path)
         finally:
-            devnull.close()
-            sys.stderr = old_stderr
-            sys.stdout = old_stdout
-        
-        self.mp_drawing = mp.solutions.drawing_utils
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+
+        return str(model_path)
+
+    def _create_pose_landmarker(self):
+        from mediapipe.tasks import python as mp_tasks_python
+        from mediapipe.tasks.python import vision as mp_tasks_vision
+
+        model_asset_path = self._ensure_pose_landmarker_model()
+
+        base_options = mp_tasks_python.BaseOptions(model_asset_path=model_asset_path)
+        options = mp_tasks_vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=mp_tasks_vision.RunningMode.VIDEO,
+            num_poses=1,
+            min_pose_detection_confidence=0.7,
+            min_pose_presence_confidence=0.7,
+            min_tracking_confidence=0.7,
+        )
+        return mp_tasks_vision.PoseLandmarker.create_from_options(options)
     
     def normalize_landmarks_to_hip_center(self, landmarks: List[Dict]) -> List[Dict]:
         """
@@ -184,6 +279,7 @@ class VideoPoseExtractor:
                         presence: List[float] = None) -> Tuple[List[Dict], List[float], List[float]]:
         """
         Mirror/flip landmarks horizontally (swap left and right).
+        The axis of reflection is the body midpoint (average x of all landmarks), not x=0.
         
         Landmark mapping for the 12 kept landmarks:
         0: L shoulder  <-> 1: R shoulder
@@ -204,12 +300,15 @@ class VideoPoseExtractor:
         if len(landmarks) != NUM_LANDMARKS:
             raise ValueError(f"Expected {NUM_LANDMARKS} landmarks, got {len(landmarks)}")
         
-        # Create mirrored landmarks by swapping left/right pairs
+        # Axis of reflection: midpoint of the body (average x of all landmarks)
+        mid_x = sum(lm['x'] for lm in landmarks) / len(landmarks)
+        # Reflection of x across mid_x: new_x = 2 * mid_x - x
+        
+        # Create mirrored landmarks by swapping left/right pairs and reflecting x about mid_x
         mirrored_landmarks = landmarks.copy()
         mirrored_visibility = visibility.copy() if visibility else None
         mirrored_presence = presence.copy() if presence else None
         
-        # Swap left/right pairs and negate x coordinate (mirror horizontally)
         swap_pairs = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11)]
         
         for left_idx, right_idx in swap_pairs:
@@ -217,14 +316,14 @@ class VideoPoseExtractor:
             left_landmark = mirrored_landmarks[left_idx].copy()
             right_landmark = mirrored_landmarks[right_idx].copy()
             
-            # Mirror x coordinate (negate it)
+            # Mirror x about body midpoint (not 0)
             mirrored_landmarks[left_idx] = {
-                'x': -right_landmark['x'],  # Negate x for mirroring
+                'x': 2 * mid_x - right_landmark['x'],
                 'y': right_landmark['y'],
                 'z': right_landmark['z']
             }
             mirrored_landmarks[right_idx] = {
-                'x': -left_landmark['x'],  # Negate x for mirroring
+                'x': 2 * mid_x - left_landmark['x'],
                 'y': left_landmark['y'],
                 'z': left_landmark['z']
             }
@@ -292,13 +391,45 @@ class VideoPoseExtractor:
             'augmented': True,  # Mark as augmented
             'augmentation_type': 'mirror'
         }
+        if 'video_speed_factor' in sequence:
+            mirrored_sequence['video_speed_factor'] = sequence['video_speed_factor']
+        if 'sequence_start_stride' in sequence:
+            mirrored_sequence['sequence_start_stride'] = sequence['sequence_start_stride']
         
         if workout_class:
             mirrored_sequence['workout_class'] = workout_class
         
         return mirrored_sequence
+
+    @staticmethod
+    def _speed_factor_frame_suffix(speed_factor: float) -> str:
+        """Filesystem-safe tag for frame output dirs (e.g. 1.25 -> _speed1p25)."""
+        s = f"{float(speed_factor):g}".replace('.', 'p')
+        return f"_speed{s}"
+
+    def _reset_pose_landmarker(self) -> None:
+        """Recreate the landmarker so a new temporal pass starts clean (VIDEO mode)."""
+        self.close()
+        self._pose_landmarker = self._create_pose_landmarker()
+
+    def _unique_speed_factors_for_augmentation(self) -> List[float]:
+        """Ordered unique speed factors excluding 1.0, for extra passes only."""
+        seen = set()
+        out: List[float] = []
+        for f in self.video_speed_factors:
+            x = float(f)
+            if x <= 0:
+                continue
+            if abs(x - 1.0) < 1e-6:
+                continue
+            key = round(x, 6)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(x)
+        return out
     
-    def extract_pose_landmarks(self, frame: np.ndarray) -> Dict:
+    def extract_pose_landmarks(self, frame: np.ndarray, timestamp_ms: int) -> Dict:
         """
         Extract pose landmarks from a single frame.
         
@@ -310,22 +441,17 @@ class VideoPoseExtractor:
         """
         # Convert BGR to RGB
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Process the frame (suppress all output during processing)
-        old_stderr = sys.stderr
-        old_stdout = sys.stdout
-        devnull = open(os.devnull, 'w')
-        sys.stderr = devnull
-        sys.stdout = devnull
+
+        # Run Pose Landmarker (MediaPipe Tasks)
+        # Note: timestamp_ms must be monotonically increasing for VIDEO mode.
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                results = self.pose.process(rgb_frame)
-        finally:
-            devnull.close()
-            sys.stderr = old_stderr
-            sys.stdout = old_stdout
-        
+                results = self._pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+        except Exception:
+            results = None
+
         # Extract landmarks
         landmarks_data = {
             'landmarks': [],
@@ -333,21 +459,21 @@ class VideoPoseExtractor:
             'presence': [],
             'detected': False
         }
-        
-        if results.pose_landmarks:
+
+        if results and getattr(results, "pose_landmarks", None):
             landmarks_data['detected'] = True
-            
+
+            pose_landmarks = results.pose_landmarks[0] if results.pose_landmarks else []
+
             all_landmarks = []
             all_visibility = []
             all_presence = []
-            for landmark in results.pose_landmarks.landmark:
-                all_landmarks.append({
-                    'x': landmark.x,
-                    'y': landmark.y,
-                    'z': landmark.z
-                })
-                all_visibility.append(landmark.visibility)
-                all_presence.append(landmark.presence)
+            for landmark in pose_landmarks:
+                all_landmarks.append({'x': float(landmark.x), 'y': float(landmark.y), 'z': float(landmark.z)})
+
+                # Tasks landmarks do not always expose visibility/presence the same way as solutions.
+                all_visibility.append(float(getattr(landmark, "visibility", 1.0)))
+                all_presence.append(float(getattr(landmark, "presence", 1.0)))
             
             # Normalize all 33 landmarks relative to hip center if flag is enabled
             if self.normalize_pose:
@@ -359,12 +485,229 @@ class VideoPoseExtractor:
             landmarks_data['presence'] = [all_presence[i] for i in KEPT_LANDMARK_INDICES]
         
         return landmarks_data
+
+    def _extract_pose_sequences_from_video_capture(
+        self,
+        cap: cv2.VideoCapture,
+        video_path: Path,
+        actual_fps: float,
+        total_frames: int,
+        output_dir: Optional[str],
+        save_frames: bool,
+        workout_class: Optional[str],
+        speed_factor: float,
+        frames_dir_suffix: str = "",
+    ) -> List[Dict]:
+        """
+        Run one pose-extraction pass over an open capture.
+
+        speed_factor: temporal resampling relative to the decimated read stream (after
+        frame_skip). Values below 1.0 slow motion (more pose samples per source frame
+        on average); values above 1.0 speed up (fewer samples). 1.0 matches legacy
+        single-pass behavior. Implemented with a fractional carry so every pass
+        completes without gaps.
+        """
+        if speed_factor <= 0:
+            raise ValueError(f"speed_factor must be positive, got {speed_factor}")
+
+        target_fps = self.target_fps
+        frames_per_sequence = self.frames_per_sequence
+        frames_available = actual_fps * self.sequence_duration
+
+        if actual_fps >= target_fps:
+            frame_skip_ratio = frames_available / frames_per_sequence
+            frame_skip = max(1, int(round(frame_skip_ratio)))
+            frame_duplication = 1
+            _vlog(f"FPS >= {self.target_fps} ({actual_fps:.2f}): Skipping frames (taking every {frame_skip} frame)")
+        else:
+            duplication_ratio = frames_per_sequence / frames_available
+            frame_skip = 1
+            frame_duplication = max(1, int(round(duplication_ratio)))
+            _vlog(
+                f"FPS < 30 ({actual_fps:.2f}): Duplicating frames "
+                f"(each frame repeated {frame_duplication} times to get 15 frames from {frames_available:.1f} frames)"
+            )
+
+        if abs(speed_factor - 1.0) >= 1e-6:
+            _vlog(
+                f"Temporal speed factor for this pass: {speed_factor:g}x "
+                f"(extra sequences vs normal-speed extraction)"
+            )
+
+        stride = (
+            self.sequence_start_stride
+            if self.sequence_start_stride is not None
+            else self.frames_per_sequence
+        )
+        if stride < self.frames_per_sequence:
+            _vlog(
+                f"Overlapping sequence windows: sequence_start_stride={stride} samples "
+                f"(overlap of {self.frames_per_sequence - stride} samples per step)"
+            )
+
+        sequences: List[Dict] = []
+        current_sequence: List[Dict] = []
+        read_idx = -1
+        resample_k = 0
+        mp_timestamp_ms = 0
+        carry = 0.0
+        _hb_last = [time.monotonic()]
+
+        processed_frame_count = 0
+        global_stream_slot_index = 0
+
+        if actual_fps < target_fps and frames_available > 0:
+            duplication_ratio = frames_per_sequence / frames_available
+            frames_needing_extra = int(round((duplication_ratio - int(duplication_ratio)) * frames_available))
+        else:
+            frames_needing_extra = 0
+
+        frames_stem = video_path.stem + frames_dir_suffix
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            read_idx += 1
+
+            if read_idx % frame_skip != 0:
+                continue
+
+            if speed_factor <= 1.0:
+                carry += 1.0
+                emit_threshold = float(speed_factor)
+                emit_decrement = float(speed_factor)
+            else:
+                carry += 1.0 / float(speed_factor)
+                emit_threshold = 1.0
+                emit_decrement = 1.0
+
+            while carry >= emit_threshold - 1e-12:
+                timestamp_ms = mp_timestamp_ms
+                mp_timestamp_ms += 33
+                pose_data = self.extract_pose_landmarks(frame, timestamp_ms)
+
+                original_timestamp = read_idx / max(actual_fps, 1e-6)
+
+                if actual_fps < target_fps:
+                    frames_in_current_sequence = global_stream_slot_index % int(frames_available)
+                    if frames_needing_extra > 0 and frames_in_current_sequence < frames_needing_extra:
+                        current_duplication = frame_duplication + 1
+                    else:
+                        current_duplication = frame_duplication
+                else:
+                    current_duplication = frame_duplication
+
+                frame_image_path = None
+                if output_dir and save_frames:
+                    frames_dir = Path(output_dir) / (frames_stem + '_frames')
+                    frames_dir.mkdir(parents=True, exist_ok=True)
+                    frame_filename = f"frame_{read_idx:06d}_k{resample_k:06d}.jpg"
+                    frame_image_path_full = frames_dir / frame_filename
+                    cv2.imwrite(str(frame_image_path_full), frame)
+                    frame_image_path = str(Path(frames_stem + '_frames') / frame_filename)
+
+                for dup_idx in range(current_duplication):
+                    frame_data = {
+                        'frame_number': read_idx,
+                        'original_frame_number': read_idx,
+                        'timestamp': original_timestamp,
+                        'sequence_frame_index': processed_frame_count + dup_idx,
+                        'pose': pose_data,
+                        'frame_image': str(frame_image_path) if frame_image_path else None
+                    }
+                    current_sequence.append(frame_data)
+
+                processed_frame_count += current_duplication
+                global_stream_slot_index += 1
+                resample_k += 1
+                carry -= emit_decrement
+
+                while len(current_sequence) >= frames_per_sequence:
+                    sequence_frames = current_sequence[:frames_per_sequence]
+                    sequence_data = {
+                        'sequence_number': len(sequences),
+                        'start_frame': sequence_frames[0]['original_frame_number'],
+                        'end_frame': sequence_frames[-1]['original_frame_number'],
+                        'start_time': sequence_frames[0]['timestamp'],
+                        'end_time': sequence_frames[-1]['timestamp'],
+                        'frames': sequence_frames,
+                        'video_fps': actual_fps,
+                        'frames_per_sequence': len(sequence_frames),
+                        'video_file': str(video_path),
+                        'video_name': video_path.stem,
+                        'video_speed_factor': float(speed_factor),
+                        'sequence_start_stride': int(stride),
+                    }
+                    if workout_class:
+                        sequence_data['workout_class'] = workout_class
+                    sequences.append(sequence_data)
+                    if self.augment_data:
+                        mirrored_sequence = self._create_mirrored_sequence(sequence_data, workout_class)
+                        sequences.append(mirrored_sequence)
+                    current_sequence = current_sequence[stride:]
+                    for i, fd in enumerate(current_sequence):
+                        fd['sequence_frame_index'] = i
+                    processed_frame_count = len(current_sequence)
+
+            now = time.monotonic()
+            if _video_pose_worker_quiet():
+                if now - _hb_last[0] >= 25.0:
+                    _hb_last[0] = now
+                    print(
+                        f"    [{video_path.name}] speed={speed_factor:g} "
+                        f"reads {read_idx + 1}/{max(total_frames, 1)} sequences={len(sequences)}",
+                        flush=True,
+                    )
+            elif read_idx % 100 == 99:
+                _vlog(
+                    f"Processed {read_idx + 1}/{total_frames} video frames, "
+                    f"created {len(sequences)} sequences..."
+                )
+
+        if current_sequence:
+            if len(current_sequence) >= frames_per_sequence // 2:
+                while len(current_sequence) < frames_per_sequence:
+                    last_frame = current_sequence[-1].copy()
+                    last_frame['sequence_frame_index'] = len(current_sequence)
+                    current_sequence.append(last_frame)
+                sequence_frames = current_sequence[:frames_per_sequence]
+                sequence_data = {
+                    'sequence_number': len(sequences),
+                    'start_frame': sequence_frames[0]['original_frame_number'],
+                    'end_frame': sequence_frames[-1]['original_frame_number'],
+                    'start_time': sequence_frames[0]['timestamp'],
+                    'end_time': sequence_frames[-1]['timestamp'],
+                    'frames': sequence_frames,
+                    'video_fps': actual_fps,
+                    'frames_per_sequence': len(sequence_frames),
+                    'video_file': str(video_path),
+                    'video_name': video_path.stem,
+                    'video_speed_factor': float(speed_factor),
+                    'sequence_start_stride': int(stride),
+                }
+                if workout_class:
+                    sequence_data['workout_class'] = workout_class
+                sequences.append(sequence_data)
+                if self.augment_data:
+                    mirrored_sequence = self._create_mirrored_sequence(sequence_data, workout_class)
+                    sequences.append(mirrored_sequence)
+
+        _vlog(f"\nExtracted {len(sequences)} sequences from this pass (speed_factor={speed_factor:g})")
+        _vlog(f"Total source frames read: {read_idx + 1}")
+        _vlog(f"Each sequence contains exactly {frames_per_sequence} frames ({self.sequence_duration} seconds)")
+        return sequences
     
     def process_video(self, video_path: str, output_dir: str = None, 
                      save_frames: bool = True, workout_class: str = None) -> List[Dict]:
         """
         Process a video file and extract pose landmarks for each frame.
         Always produces sequences with exactly 15 frames representing 0.5 seconds.
+        
+        When ``video_speed_augment`` is enabled, runs an additional pass per entry in
+        ``video_speed_factors`` (excluding 1.0) and concatenates those sequences after
+        the normal-speed pass. Sliding windows use ``sequence_start_stride`` from the
+        extractor constructor.
         
         Args:
             video_path: Path to the input video file
@@ -405,213 +748,62 @@ class VideoPoseExtractor:
                     video_key = video_path.name
             
             if video_key in ignored_videos:
-                print(f"Video {video_path.name} is in ignore list, skipping...")
+                _vlog(f"Video {video_path.name} is in ignore list, skipping...")
                 return []
         
-        # Open video file
-        cap = cv2.VideoCapture(str(video_path))
-        
-        if not cap.isOpened():
-            raise ValueError(f"Could not open video file: {video_path}")
-        
-        # Get video properties
-        actual_fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        print(f"Processing video: {video_path.name}")
-        print(f"FPS: {actual_fps:.2f}, Total frames: {total_frames}, Resolution: {width}x{height}")
+        _vlog(f"Processing video: {video_path.name}")
         if workout_class:
-            print(f"Workout class: {workout_class}")
-        
-        # Target: 15 frames per 0.5 seconds = 30 frames per second
-        target_fps = self.target_fps
-        frames_per_sequence = self.frames_per_sequence  # Always 15 frames per sequence
-        
-        # Calculate frame sampling strategy
-        # We need exactly 15 frames to represent 0.5 seconds
-        # Frames available from video for 0.5 seconds = actual_fps * 0.5
-        frames_available = actual_fps * self.sequence_duration
-        
-        # Calculate sampling ratio
-        if actual_fps >= target_fps:
-            # Skip frames: take every Nth frame
-            # For 0.5 seconds: we have (actual_fps * 0.5) frames, need 15
-            frame_skip_ratio = frames_available / frames_per_sequence
-            frame_skip = max(1, int(round(frame_skip_ratio)))
-            frame_duplication = 1
-            print(f"FPS >= {self.target_fps} ({actual_fps:.2f}): Skipping frames (taking every {frame_skip} frame)")
-        else:
-            # Duplicate frames: repeat frames to reach 15 frames
-            # For 0.5 seconds: we have (actual_fps * 0.5) frames, need 15
-            duplication_ratio = frames_per_sequence / frames_available
-            frame_skip = 1
-            frame_duplication = max(1, int(round(duplication_ratio)))
-            print(f"FPS < 30 ({actual_fps:.2f}): Duplicating frames "
-                  f"(each frame repeated {frame_duplication} times to get 15 frames from {frames_available:.1f} frames)")
-        
-        sequences = []
-        current_sequence = []
-        frame_count = 0
-        processed_frame_count = 0  # Count of frames added to sequences
-        frames_in_sequence_from_video = 0  # Count of video frames processed for current sequence
-        
-        # For fractional duplication ratios, use a pattern
-        if actual_fps < target_fps and frames_available > 0:
-            duplication_ratio = frames_per_sequence / frames_available
-            # Calculate how many frames need extra duplication
-            # e.g., for 24fps: 15/12 = 1.25, so 3 out of 12 frames need 2x duplication
-            frames_needing_extra = int(round((duplication_ratio - int(duplication_ratio)) * frames_available))
-        else:
-            frames_needing_extra = 0
-        
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            # Determine if we should process this frame
-            should_process = (frame_count % frame_skip == 0)
-            
-            if should_process:
-                # Extract pose landmarks
-                pose_data = self.extract_pose_landmarks(frame)
-                
-                # Calculate timestamp based on original video frame
-                original_timestamp = frame_count / actual_fps
-                
-                # Determine duplication for this frame
-                # For fractional ratios, some frames get extra duplication
-                if actual_fps < target_fps:
-                    # Check if this frame needs extra duplication
-                    frames_in_current_sequence = frames_in_sequence_from_video % int(frames_available)
-                    if frames_needing_extra > 0 and frames_in_current_sequence < frames_needing_extra:
-                        current_duplication = frame_duplication + 1
-                    else:
-                        current_duplication = frame_duplication
-                else:
-                    current_duplication = frame_duplication
-                
-                # Save frame image if output directory is specified and save_frames is True
-                frame_image_path = None
-                if output_dir and save_frames:
-                    # Create frames directory for this sequence
-                    frames_dir = Path(output_dir) / (video_path.stem + '_frames')
-                    frames_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Save frame image
-                    frame_filename = f"frame_{frame_count:06d}.jpg"
-                    frame_image_path_full = frames_dir / frame_filename
-                    cv2.imwrite(str(frame_image_path_full), frame)
-                    
-                    # Store relative path for portability
-                    frame_image_path = str(Path(video_path.stem + '_frames') / frame_filename)
-                
-                # Add frame data to sequence (with duplication if needed)
-                for dup_idx in range(current_duplication):
-                    frame_data = {
-                        'frame_number': frame_count,
-                        'original_frame_number': frame_count,
-                        'timestamp': original_timestamp,
-                        'sequence_frame_index': processed_frame_count + dup_idx,
-                        'pose': pose_data,
-                        'frame_image': str(frame_image_path) if frame_image_path else None
-                    }
-                    current_sequence.append(frame_data)
-                
-                processed_frame_count += current_duplication
-                frames_in_sequence_from_video += 1
-                
-                # When we have a complete sequence (exactly 15 frames), save it
-                if len(current_sequence) >= frames_per_sequence:
-                    # Take exactly 15 frames
-                    sequence_frames = current_sequence[:frames_per_sequence]
-                    
-                    sequence_data = {
-                        'sequence_number': len(sequences),
-                        'start_frame': sequence_frames[0]['original_frame_number'],
-                        'end_frame': sequence_frames[-1]['original_frame_number'],
-                        'start_time': sequence_frames[0]['timestamp'],
-                        'end_time': sequence_frames[-1]['timestamp'],
-                        'frames': sequence_frames,
-                        'video_fps': actual_fps,
-                        'frames_per_sequence': len(sequence_frames),
-                        'video_file': str(video_path),
-                        'video_name': video_path.stem
-                    }
-                    
-                    # Add workout class label if provided
-                    if workout_class:
-                        sequence_data['workout_class'] = workout_class
-                    
-                    sequences.append(sequence_data)
-                    
-                    # Apply data augmentation if enabled
-                    if self.augment_data:
-                        # Create mirrored version of the sequence
-                        mirrored_sequence = self._create_mirrored_sequence(sequence_data, workout_class)
-                        sequences.append(mirrored_sequence)
-                    
-                    # Start new sequence (non-overlapping)
-                    current_sequence = []
-                    processed_frame_count = 0
-                    frames_in_sequence_from_video = 0
-            
-            frame_count += 1
-            
-            # Progress indicator
-            if frame_count % 100 == 0:
-                print(f"Processed {frame_count}/{total_frames} video frames, "
-                      f"created {len(sequences)} sequences...")
-        
-        # Handle remaining frames if any (only if we have at least some frames)
-        if current_sequence:
-            # Pad with last frame if needed to reach 15 frames, or use as-is if close
-            if len(current_sequence) >= frames_per_sequence // 2:
-                # Pad to 15 frames with last frame
-                while len(current_sequence) < frames_per_sequence:
-                    last_frame = current_sequence[-1].copy()
-                    last_frame['sequence_frame_index'] = len(current_sequence)
-                    current_sequence.append(last_frame)
-                
-                sequence_frames = current_sequence[:frames_per_sequence]
-                sequence_data = {
-                    'sequence_number': len(sequences),
-                    'start_frame': sequence_frames[0]['original_frame_number'],
-                    'end_frame': sequence_frames[-1]['original_frame_number'],
-                    'start_time': sequence_frames[0]['timestamp'],
-                    'end_time': sequence_frames[-1]['timestamp'],
-                    'frames': sequence_frames,
-                    'video_fps': actual_fps,
-                    'frames_per_sequence': len(sequence_frames),
-                    'video_file': str(video_path),
-                    'video_name': video_path.stem
-                }
-                
-                # Add workout class label if provided
-                if workout_class:
-                    sequence_data['workout_class'] = workout_class
-                
-                sequences.append(sequence_data)
-                
-                # Apply data augmentation if enabled
-                if self.augment_data:
-                    # Create mirrored version of the sequence
-                    mirrored_sequence = self._create_mirrored_sequence(sequence_data, workout_class)
-                    sequences.append(mirrored_sequence)
-        
-        cap.release()
-        
-        print(f"\nExtracted {len(sequences)} sequences from video")
-        print(f"Total video frames processed: {frame_count}")
-        print(f"Each sequence contains exactly {frames_per_sequence} frames ({self.sequence_duration} seconds)")
-        
-        # Save output if output directory is specified
+            _vlog(f"Workout class: {workout_class}")
+
+        speed_passes: List[Tuple[float, str]] = [(1.0, "")]
+        if self.video_speed_augment:
+            for sf in self._unique_speed_factors_for_augmentation():
+                speed_passes.append((sf, self._speed_factor_frame_suffix(sf)))
+
+        all_sequences: List[Dict] = []
+        actual_fps_for_save: float = 30.0
+
+        for pass_idx, (speed_factor, frame_suffix) in enumerate(speed_passes):
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                raise ValueError(f"Could not open video file: {video_path}")
+
+            actual_fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            actual_fps_for_save = float(actual_fps)
+
+            if pass_idx == 0:
+                _vlog(f"FPS: {actual_fps:.2f}, Total frames: {total_frames}, Resolution: {width}x{height}")
+
+            part = self._extract_pose_sequences_from_video_capture(
+                cap,
+                video_path,
+                actual_fps,
+                total_frames,
+                output_dir,
+                save_frames,
+                workout_class,
+                speed_factor,
+                frames_dir_suffix=frame_suffix,
+            )
+            cap.release()
+
+            if pass_idx + 1 < len(speed_passes):
+                self._reset_pose_landmarker()
+
+            all_sequences.extend(part)
+
+        for i, seq in enumerate(all_sequences):
+            seq['sequence_number'] = i
+
+        _vlog(f"\nTotal sequences (all speed passes): {len(all_sequences)}")
+
         if output_dir:
-            self.save_output(sequences, video_path, output_dir, actual_fps)
-        
-        return sequences
+            self.save_output(all_sequences, video_path, output_dir, actual_fps_for_save)
+
+        return all_sequences
     
     def save_output(self, sequences: List[Dict], video_path: Path, output_dir: str, actual_fps: float):
         """
@@ -631,12 +823,18 @@ class VideoPoseExtractor:
         output_path = output_dir / output_filename
         
         # Prepare output data
+        eff_stride = (
+            self.sequence_start_stride
+            if self.sequence_start_stride is not None
+            else self.frames_per_sequence
+        )
         output_data = {
             'video_file': str(video_path),
             'video_fps': actual_fps,
             'target_fps': 30.0,
             'sequence_duration': self.sequence_duration,
             'frames_per_sequence': self.frames_per_sequence,  # Always 15 frames
+            'sequence_start_stride': int(eff_stride),
             'total_sequences': len(sequences),
             'sequences': sequences
         }
@@ -651,7 +849,7 @@ class VideoPoseExtractor:
             with open(output_path, 'w') as f:
                 json.dump(output_data, f, indent=2)
         
-        print(f"Output saved to: {output_path}")
+        _vlog(f"Output saved to: {output_path}")
         
         # Also save individual sequence files
         sequences_dir = output_dir / (video_path.stem + '_sequences')
@@ -665,7 +863,7 @@ class VideoPoseExtractor:
                 with open(seq_path, 'w') as f:
                     json.dump(sequence, f, indent=2)
         
-        print(f"Individual sequence files saved to: {sequences_dir}")
+        _vlog(f"Individual sequence files saved to: {sequences_dir}")
     
     def extract_pose_features(self, sequence: Dict) -> np.ndarray:
         """
@@ -766,8 +964,8 @@ class VideoPoseExtractor:
             with open(metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=2)
         
-        print(f"NumPy training data saved to: {npz_path}")
-        print(f"Metadata saved to: {metadata_path}")
+        _vlog(f"NumPy training data saved to: {npz_path}")
+        _vlog(f"Metadata saved to: {metadata_path}")
         
         return str(npz_path)
     
@@ -906,30 +1104,53 @@ class VideoPoseExtractor:
             
             if effective_processes > 1 and len(video_files) > 1:
                 # Use multiprocessing
-                print(f"  Using {effective_processes} parallel processes")
+                print(
+                    f"  Using {effective_processes} parallel processes "
+                    f"(progress completes in any order; workers run quiet unless "
+                    f"--verbose-pool-workers)"
+                )
                 
                 # Prepare arguments for worker function
                 worker_args = [
                     (video_file, workout_output_dir, save_frames, workout_class, 
                      int(self.target_fps), self.sequence_duration,
-                     self.normalize_pose, self.augment_data)
+                     self.normalize_pose, self.augment_data,
+                     self.video_speed_augment, self.video_speed_factors,
+                     self.sequence_start_stride,
+                     self.verbose_pool_workers)
                     for video_file in video_files
                 ]
                 
-                # Process videos in parallel
-                with Pool(processes=effective_processes) as pool:
-                    # Use position 1 for workout-specific progress bar (above overall bar)
-                    results = []
+                # imap_unordered: progress advances as each video finishes (not in file order),
+                # so one long clip does not block the tqdm bar. Workers default to quiet prints.
+                pool = Pool(processes=effective_processes)
+                interrupted = False
+                results = []
+                try:
+                    it = pool.imap_unordered(
+                        process_single_video_worker,
+                        worker_args,
+                        chunksize=1,
+                    )
                     for result in tqdm(
-                        pool.imap(process_single_video_worker, worker_args),
+                        it,
                         total=len(video_files),
                         desc=f"  {workout_class[:30]:<30}",
                         position=1,
-                        leave=False
+                        leave=False,
                     ):
                         results.append(result)
-                        # Update overall progress bar
                         overall_pbar.update(1)
+                except KeyboardInterrupt:
+                    interrupted = True
+                    print("\nInterrupted — terminating worker pool...", flush=True)
+                    pool.terminate()
+                    pool.join()
+                    raise
+                finally:
+                    if not interrupted:
+                        pool.close()
+                        pool.join()
                 
                 # Collect results
                 for video_path, sequences, error in results:
@@ -970,13 +1191,19 @@ class VideoPoseExtractor:
             # Save workout-specific training data
             if workout_sequences:
                 # Save workout-specific JSON
+                eff_stride = (
+                    self.sequence_start_stride
+                    if self.sequence_start_stride is not None
+                    else self.frames_per_sequence
+                )
                 workout_data = {
                     'metadata': {
                         'workout_class': workout_class,
                         'total_sequences': len(workout_sequences),
                         'frames_per_sequence': self.frames_per_sequence,
                         'sequence_duration': self.sequence_duration,
-                        'target_fps': self.target_fps
+                        'target_fps': self.target_fps,
+                        'sequence_start_stride': int(eff_stride),
                     },
                     'sequences': workout_sequences
                 }
@@ -1001,6 +1228,11 @@ class VideoPoseExtractor:
                     traceback.print_exc()
         
         # Save consolidated training data
+        eff_stride = (
+            self.sequence_start_stride
+            if self.sequence_start_stride is not None
+            else self.frames_per_sequence
+        )
         training_data = {
             'metadata': {
                 'total_sequences': len(all_sequences),
@@ -1009,7 +1241,8 @@ class VideoPoseExtractor:
                 'class_distribution': class_counts,
                 'frames_per_sequence': self.frames_per_sequence,
                 'sequence_duration': self.sequence_duration,
-                'target_fps': self.target_fps
+                'target_fps': self.target_fps,
+                'sequence_start_stride': int(eff_stride),
             },
             'sequences': all_sequences
         }
@@ -1072,12 +1305,21 @@ def process_single_video_worker(args_tuple):
     Worker function for multiprocessing. Processes a single video file.
     
     Args:
-        args_tuple: Tuple of (video_path, output_dir, save_frames, workout_class, fps, sequence_duration, normalize_pose, augment_data)
+        args_tuple: Tuple of (video_path, output_dir, save_frames, workout_class, fps,
+            sequence_duration, normalize_pose, augment_data, video_speed_augment,
+            video_speed_factors, sequence_start_stride, verbose_pool_workers)
     
     Returns:
         Tuple of (video_path, sequences, error) where error is None if successful
     """
-    video_path, output_dir, save_frames, workout_class, fps, sequence_duration, normalize_pose, augment_data = args_tuple
+    (video_path, output_dir, save_frames, workout_class, fps, sequence_duration,
+     normalize_pose, augment_data, video_speed_augment, video_speed_factors,
+     sequence_start_stride, verbose_pool_workers) = args_tuple
+
+    if verbose_pool_workers:
+        os.environ.pop('VIDEO_POSE_EXTRACT_QUIET', None)
+    else:
+        os.environ['VIDEO_POSE_EXTRACT_QUIET'] = '1'
     
     try:
         # Create a new extractor instance for this process
@@ -1086,7 +1328,10 @@ def process_single_video_worker(args_tuple):
             fps=fps, 
             sequence_duration=sequence_duration,
             normalize_pose=normalize_pose,
-            augment_data=augment_data
+            augment_data=augment_data,
+            video_speed_augment=video_speed_augment,
+            video_speed_factors=video_speed_factors,
+            sequence_start_stride=sequence_start_stride,
         )
         
         # Process the video
@@ -1178,8 +1423,52 @@ def main():
         default=False,
         help='Apply data augmentation (mirror sequences) (default: False)'
     )
+    parser.add_argument(
+        '--video-speed-augment',
+        action='store_true',
+        default=False,
+        help='After the normal pass, re-scan the video at each speed in --video-speed-factors '
+             'and append those sequences (default: False)'
+    )
+    parser.add_argument(
+        '--video-speed-factors',
+        type=str,
+        default='0.75,1.25',
+        metavar='LIST',
+        help='Comma-separated playback speed multipliers for --video-speed-augment '
+             '(e.g. "0.5,0.75,1,1.2,1.9"). Values of 1.0 are skipped. Default: 0.75,1.25'
+    )
+    parser.add_argument(
+        '--sequence-start-stride',
+        type=int,
+        default=None,
+        metavar='N',
+        help='Advance this many stream samples between consecutive sequence starts '
+             '(after frame_skip / speed resampling). Smaller than frames-per-sequence '
+             'creates overlapping windows. Default: same as frames per sequence (no overlap). '
+             'Must be between 1 and frames-per-sequence (from --fps and --duration).'
+    )
+    parser.add_argument(
+        '--verbose-pool-workers',
+        action='store_true',
+        default=False,
+        help='In batch multiprocessing mode, print full per-video logs from each worker '
+             '(default: quiet workers + heartbeat; progress uses unordered completion).'
+    )
     
     args = parser.parse_args()
+
+    speed_factors_tuple: Optional[Tuple[float, ...]] = None
+    if args.video_speed_augment:
+        raw_parts = [p.strip() for p in args.video_speed_factors.split(',') if p.strip()]
+        if not raw_parts:
+            print('Error: --video-speed-factors must list at least one number when using --video-speed-augment')
+            return 1
+        try:
+            speed_factors_tuple = tuple(float(p) for p in raw_parts)
+        except ValueError:
+            print('Error: --video-speed-factors must be comma-separated floats')
+            return 1
     
     input_path = Path(args.input_path)
     
@@ -1191,7 +1480,11 @@ def main():
         fps=args.fps, 
         sequence_duration=args.duration,
         normalize_pose=args.normalize_pose,
-        augment_data=args.augment_data
+        augment_data=args.augment_data,
+        video_speed_augment=args.video_speed_augment,
+        video_speed_factors=speed_factors_tuple,
+        sequence_start_stride=args.sequence_start_stride,
+        verbose_pool_workers=args.verbose_pool_workers,
     )
     
     try:
